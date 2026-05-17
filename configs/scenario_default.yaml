@@ -1,0 +1,67 @@
+fog_topology:
+  n_fog_nodes: 5
+  n_user_devices: 50
+  n_applications: 3
+  fog_node_cpu_mips: [500, 1000, 2000, 4000, 8000]
+  fog_node_memory_mb: [512, 1024, 2048, 4096, 8192]
+  fog_node_energy_idle_w: [5, 10, 20, 40, 80]
+  fog_node_energy_active_w: [10, 25, 50, 100, 200]
+  cloud_cpu_mips: 100000
+  cloud_latency_base_ms: 80
+
+user_devices:
+  cpu_mips_range: [100, 500]
+  memory_mb_range: [256, 2048]
+  mobility: true
+  mobility_update_interval_s: 10
+
+network:
+  bandwidth_mbps_range: [5, 100]
+  latency_base_ms_range: [2, 50]
+  latency_jitter_ms: 2
+  packet_loss_rate: 0.001
+
+applications:
+  - id: 0
+    name: "video_analytics"
+    task_cpu_mips_range: [200, 800]
+    task_memory_mb_range: [64, 256]
+    task_data_size_kb_range: [100, 5000]
+    deadline_ms_range: [50, 500]
+    module_count: 3
+  - id: 1
+    name: "iot_aggregation"
+    task_cpu_mips_range: [50, 200]
+    task_memory_mb_range: [32, 128]
+    task_data_size_kb_range: [1, 100]
+    deadline_ms_range: [100, 1000]
+    module_count: 2
+  - id: 2
+    name: "ar_processing"
+    task_cpu_mips_range: [500, 2000]
+    task_memory_mb_range: [128, 512]
+    task_data_size_kb_range: [500, 10000]
+    deadline_ms_range: [20, 200]
+    module_count: 4
+
+simulation:
+  n_episodes: 1000
+  timesteps_per_episode: 100
+  seed: 42
+  scheduling_policies: [first_fit, round_robin, energy_aware, random]
+
+migration:
+  load_threshold_trigger: 0.80
+  load_threshold_relief: 0.50
+  migration_bandwidth_energy_coeff: 0.001  # J per KB transferred
+  migration_latency_coeff: 0.01            # ms per KB
+  qos_degradation_trigger_ms: 50
+
+dataset:
+  output_dir: datasets/
+  scheduler_file: scheduler_dataset.csv
+  rescheduler_file: rescheduler_dataset.csv
+  validate: true
+  train_split: 0.75
+  val_split: 0.15
+  test_split: 0.10
