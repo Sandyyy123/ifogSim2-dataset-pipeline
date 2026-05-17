@@ -1,25 +1,35 @@
 """
-Dataset builder - orchestrates simulation episodes to produce scheduler and rescheduler datasets.
+Dataset builder - orchestrates episodes to produce all 6 CSV streams.
+
+Outputs:
+  scheduler_decisions    - one row per task arrival
+  scheduler_candidates   - one row per node evaluated per decision
+  scheduler_outcomes     - one row per executed task
+  migration_decisions    - one row per migration evaluation
+  migration_candidates   - one row per candidate (NO_MIGRATION always rank 0)
+  migration_outcomes     - one row per migration event
 """
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from typing import Tuple, List
+from typing import Dict
 
-from .schema import SchedulerRecord, ReschedulerRecord, records_to_dataframe
+from .schema import records_to_dataframe, DATASET_NAMES
 from .topology_generator import FogTopology
 from .simulator import iFogSim2Simulator
+
+MIGRATION_TRIGGERS = ["mobility", "overload", "sla_breach", "energy"]
 
 
 class DatasetBuilder:
     """
-    Runs simulation episodes using multiple scheduling policies to generate
-    diverse, publication-quality training datasets for ML/RL models.
+    Runs simulation episodes using teacher policy + policy rotation
+    to produce 6 linked CSVs for ML/RL training.
 
     Args:
         cfg: Full config dict (from YAML)
-        seed: Random seed for reproducibility
+        seed: Random seed for full reproducibility
     """
 
     def __init__(self, cfg: dict, seed: int = 42):
@@ -29,85 +39,74 @@ class DatasetBuilder:
         self.topology = FogTopology(cfg, seed=seed)
         self.simulator = iFogSim2Simulator(self.topology, cfg, rng=self.rng)
 
-    def run_scheduler_episode(
-        self, episode_id: int, n_timesteps: int
-    ) -> List[SchedulerRecord]:
-        """Run one simulation episode and collect scheduler decision records."""
-        records = []
-        self.simulator.reset_loads()
-        policies = self.cfg["simulation"]["scheduling_policies"]
-
-        task_id = 0
-        for t in range(n_timesteps):
-            # Mobility update every 10 steps
-            if t % 10 == 0:
-                self.topology.update_device_locations()
-
-            # Sample application and device
-            n_apps = self.cfg["fog_topology"]["n_applications"]
-            app_id = int(self.rng.integers(0, n_apps))
-            dev_id = int(self.rng.integers(0, self.cfg["fog_topology"]["n_user_devices"]))
-
-            task = self.topology.generate_task(app_id, task_id, dev_id)
-            task["episode_id"] = episode_id
-            task["timestep"] = t
-
-            # Use one scheduling policy per timestep (rotate for diversity)
-            policy = policies[t % len(policies)]
-            fog_node = self.simulator.apply_scheduling_policy(task, policy)
-
-            record = self.simulator.schedule(task, fog_node, policy)
-            records.append(record)
-            task_id += 1
-
-        return records
-
-    def run_rescheduler_episode(
-        self, episode_id: int, n_timesteps: int
-    ) -> List[ReschedulerRecord]:
-        """Run one simulation episode and collect rescheduler decision records."""
-        records = []
-        self.simulator.reset_loads()
-        n_fog = len(self.topology.fog_nodes)
-        n_apps = self.cfg["fog_topology"]["n_applications"]
-
-        module_id = 0
-        for t in range(n_timesteps):
-            # Evaluate migration for each fog node pair combination
-            n_pairs = min(n_fog * (n_fog - 1), 5)  # max 5 pairs per timestep
-            evaluated = set()
-            for _ in range(n_pairs):
-                cur = int(self.rng.integers(0, n_fog))
-                cand = int(self.rng.integers(0, n_fog))
-                if cur == cand or (cur, cand) in evaluated:
-                    continue
-                evaluated.add((cur, cand))
-                app_id = int(self.rng.integers(0, n_apps))
-                record = self.simulator.evaluate_migration(
-                    module_id, app_id, cur, cand, episode_id, t
-                )
-                records.append(record)
-                module_id += 1
-
-        return records
-
-    def build_dataset(self, n_episodes: int = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def build_dataset(self, n_episodes: int = None) -> Dict[str, pd.DataFrame]:
         """
-        Run all episodes and return (scheduler_df, rescheduler_df).
+        Run all episodes. Returns dict keyed by DATASET_NAMES.
 
         Args:
             n_episodes: Override config value if provided.
         """
         n = n_episodes or self.cfg["simulation"]["n_episodes"]
         timesteps = self.cfg["simulation"]["timesteps_per_episode"]
+        mig_freq = self.cfg.get("simulation", {}).get("migration_eval_freq", 10)
 
-        scheduler_records, rescheduler_records = [], []
+        sched_decisions, sched_candidates, sched_outcomes = [], [], []
+        mig_decisions, mig_candidates, mig_outcomes = [], [], []
+
+        module_counter = 0
 
         for ep in tqdm(range(n), desc="Simulating episodes"):
-            scheduler_records.extend(self.run_scheduler_episode(ep, timesteps))
-            rescheduler_records.extend(self.run_rescheduler_episode(ep, timesteps))
+            self.simulator.reset_loads()
+            task_counter = 0
 
-        sched_df = records_to_dataframe(scheduler_records)
-        resched_df = records_to_dataframe(rescheduler_records)
+            # Mobility + task scheduling
+            for step in range(timesteps):
+                if step % 10 == 0:
+                    self.topology.update_device_locations()
 
-        return sched_df, resched_df
+                n_apps = self.cfg["fog_topology"]["n_applications"]
+                n_devs = self.cfg["fog_topology"]["n_user_devices"]
+                app_id = int(self.rng.integers(0, n_apps))
+                dev_id = f"dev-{int(self.rng.integers(0, n_devs))}"
+
+                task = self.topology.generate_task(app_id, task_counter, dev_id)
+                task_id = f"ep{ep}-t{step}-{task_counter}"
+                task["task_id"] = task_id
+                task["device_id"] = dev_id
+
+                dec, cands, out = self.simulator.schedule(task, ep, step)
+                sched_decisions.append(dec)
+                sched_candidates.extend(cands)
+                sched_outcomes.append(out)
+                task_counter += 1
+
+                # Evaluate migration periodically
+                if step % mig_freq == 0 and step > 0:
+                    n_fog = len(self.topology.fog_nodes)
+                    cur_node = int(self.rng.integers(0, n_fog))
+                    trigger = MIGRATION_TRIGGERS[step % len(MIGRATION_TRIGGERS)]
+                    module_id = f"mod-ep{ep}-s{step}-{module_counter}"
+                    m_dec, m_cands, m_out = self.simulator.evaluate_migration(
+                        module_id=module_id,
+                        app_id=app_id,
+                        device_id=dev_id,
+                        current_node_idx=cur_node,
+                        trigger_type=trigger,
+                        episode_id=ep,
+                        step_id=step,
+                    )
+                    mig_decisions.append(m_dec)
+                    mig_candidates.extend(m_cands)
+                    mig_outcomes.append(m_out)
+                    module_counter += 1
+
+        datasets = {
+            "scheduler_decisions": records_to_dataframe(sched_decisions),
+            "scheduler_candidates": records_to_dataframe(sched_candidates),
+            "scheduler_outcomes": records_to_dataframe(sched_outcomes),
+            "migration_decisions": records_to_dataframe(mig_decisions),
+            "migration_candidates": records_to_dataframe(mig_candidates),
+            "migration_outcomes": records_to_dataframe(mig_outcomes),
+        }
+
+        return datasets
